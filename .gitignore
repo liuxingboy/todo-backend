@@ -1,41 +1,16 @@
-# Prerequisites
-*.d
-
-# Compiled Object files
-*.slo
-*.lo
+# 编译产物
+build/
+CMakeCache.txt
+CMakeFiles/
+Makefile
 *.o
-*.obj
-
-# Precompiled Headers
-*.gch
-*.pch
-
-# Linker files
-*.ilk
-
-# Debugger Files
-*.pdb
-
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
 *.a
-*.lib
+*.so
 
-# Executables
-*.exe
-*.out
-*.app
+# 用户上传的真实文件和日志
+shared_files_storage/
+*.log
 
-# debug information files
-*.dwo
+# 编辑器配置
+.vscode/
+.idea/
