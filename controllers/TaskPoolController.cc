@@ -19,6 +19,7 @@ public:
     ADD_METHOD_TO(TaskPoolController::createPool, "/api/pools", Post, "AuthFilter");
     ADD_METHOD_TO(TaskPoolController::addTaskToPool, "/api/pools/task", Post, "AuthFilter");
     ADD_METHOD_TO(TaskPoolController::deletePool, "/api/pools", Delete, "AuthFilter");
+    ADD_METHOD_TO(TaskPoolController::deletePoolTask, "/api/pools/tasks/{1}", Delete, "AuthFilter");
     METHOD_LIST_END
 
     // 1. 获取用户所有的任务池及池内模板
@@ -154,6 +155,38 @@ public:
 
         } catch (const std::exception &e) {
             LOG_ERROR << "[TaskPool] Error deleting pool: " << e.what();
+            co_return createErrorResp(500, "Database Error");
+        }
+    }
+
+    // 删除任务池内的指定任务 (严防越权)
+    Task<HttpResponsePtr> deletePoolTask(HttpRequestPtr req, std::string taskId) {
+        // 从拦截器上下文中获取当前登录的 userId
+        auto userId = req->attributes()->get<int64_t>("user_id");
+        auto db = app().getDbClient();
+
+        try {
+            // 极其硬核的连表删除：只有当该 task 隶属的 pool 的 owner 是当前用户时，才允许删除
+            auto result = co_await db->execSqlCoro(
+                "DELETE pt FROM pool_tasks pt "
+                "JOIN task_pools tp ON pt.pool_id = tp.id "
+                "WHERE pt.id = ? AND tp.user_id = ?",
+                taskId, userId
+            );
+
+            // affectedRows() 返回受影响的行数。如果为 0，说明要么任务 ID 不存在，要么是黑客在尝试删别人的数据
+            if (result.affectedRows() == 0) {
+                LOG_WARN << "[TaskPool] Delete attempt failed or denied. TaskID: " << taskId << ", UserID: " << userId;
+                co_return createErrorResp(403, "Permission denied or task not found");
+            }
+
+            Json::Value ret;
+            ret["code"] = 0;
+            ret["msg"] = "Task deleted successfully";
+            co_return HttpResponse::newHttpJsonResponse(ret);
+
+        } catch (const std::exception &e) {
+            LOG_ERROR << "[TaskPool] Error deleting task: " << e.what();
             co_return createErrorResp(500, "Database Error");
         }
     }
