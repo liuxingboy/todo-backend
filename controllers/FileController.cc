@@ -3,8 +3,31 @@
 #include <drogon/MultiPart.h>
 #include <trantor/utils/Date.h>
 #include <cstdio> // 用于物理删除文件 std::remove
+#include <openssl/rand.h>
+#include <chrono>
+#include <mutex>
+#include <unordered_map>
+#include <filesystem>
 
 using namespace drogon;
+
+namespace {
+struct DownloadTicket {
+    std::string fileId;
+    std::chrono::steady_clock::time_point expires;
+};
+std::mutex ticketMutex;
+std::unordered_map<std::string, DownloadTicket> downloadTickets;
+HttpResponsePtr downloadError(HttpStatusCode status, const char* message) {
+    Json::Value body;
+    body["code"] = static_cast<int>(status);
+    body["msg"] = message;
+    auto response = HttpResponse::newHttpJsonResponse(body);
+    response->setStatusCode(status);
+    response->addHeader("Cache-Control", "no-store");
+    return response;
+}
+}
 
 static HttpResponsePtr createErrorResp(int code, const std::string& msg) {
     Json::Value ret;
@@ -21,6 +44,8 @@ public:
     ADD_METHOD_TO(FileController::listFiles, "/api/files", Get, "AuthFilter");
     // {1} 代表占位符，接收路径上的 file_id
     ADD_METHOD_TO(FileController::downloadFile, "/api/files/download/{1}", Get, "AuthFilter");
+    ADD_METHOD_TO(FileController::issueDownloadTicket, "/api/files/download-ticket/{1}", Post, "AuthFilter");
+    ADD_METHOD_TO(FileController::browserDownload, "/api/files/browser-download/{1}", Get);
     // {1} 代表占位符，接收路径上的 file_id
     ADD_METHOD_TO(FileController::deleteFile, "/api/files/{1}", Delete, "AuthFilter");
     METHOD_LIST_END
@@ -99,6 +124,62 @@ public:
             LOG_ERROR << "[File] Error getting list: " << e.what();
             co_return createErrorResp(500, "Database Error");
         }
+    }
+
+    Task<HttpResponsePtr> issueDownloadTicket(HttpRequestPtr req, std::string fileId) {
+        if (fileId.empty() || fileId.find_first_not_of("0123456789") != std::string::npos)
+            co_return downloadError(k400BadRequest, "Invalid file ID");
+        try {
+            auto result = co_await app().getDbClient()->execSqlCoro(
+                "SELECT file_path FROM shared_files WHERE id = ?", fileId);
+            if (result.empty() || !std::filesystem::is_regular_file(result[0]["file_path"].as<std::string>()))
+                co_return downloadError(k404NotFound, "File not found");
+            unsigned char random[32];
+            if (RAND_bytes(random, sizeof(random)) != 1)
+                co_return downloadError(k500InternalServerError, "Cannot create download ticket");
+            constexpr char hex[] = "0123456789abcdef";
+            std::string ticket;
+            for (auto byte : random) {
+                ticket += hex[byte >> 4];
+                ticket += hex[byte & 15];
+            }
+            {
+                std::lock_guard<std::mutex> lock(ticketMutex);
+                const auto now = std::chrono::steady_clock::now();
+                for (auto it = downloadTickets.begin(); it != downloadTickets.end();) {
+                    if (it->second.expires <= now) it = downloadTickets.erase(it);
+                    else ++it;
+                }
+                if (downloadTickets.size() >= 10000)
+                    co_return downloadError(k503ServiceUnavailable, "Please retry later");
+                downloadTickets.emplace(ticket, DownloadTicket{fileId, now + std::chrono::minutes(5)});
+            }
+            Json::Value body;
+            body["code"] = 0;
+            body["data"]["download_url"] = "/api/files/browser-download/" + fileId + "?ticket=" + ticket;
+            body["data"]["expires_in"] = 300;
+            auto response = HttpResponse::newHttpJsonResponse(body);
+            response->addHeader("Cache-Control", "no-store");
+            co_return response;
+        } catch (const std::exception& e) {
+            LOG_ERROR << "[File] Download ticket error: " << e.what();
+            co_return downloadError(k500InternalServerError, "Cannot create download ticket");
+        }
+    }
+
+    Task<HttpResponsePtr> browserDownload(HttpRequestPtr req, std::string fileId) {
+        {
+            std::lock_guard<std::mutex> lock(ticketMutex);
+            auto it = downloadTickets.find(req->getParameter("ticket"));
+            if (it == downloadTickets.end() || it->second.fileId != fileId ||
+                it->second.expires <= std::chrono::steady_clock::now())
+                co_return downloadError(k403Forbidden, "Download link expired or invalid");
+        }
+        // Tickets remain reusable during their lifetime for browser retries.
+        auto response = co_await downloadFile(req, fileId);
+        response->addHeader("Cache-Control", "private, no-store");
+        response->addHeader("Referrer-Policy", "no-referrer");
+        co_return response;
     }
 
     // 3. 下载文件
